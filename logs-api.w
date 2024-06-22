@@ -1,7 +1,15 @@
 bring cloud; 
+bring cognito;
 bring ex;
 bring util;
 bring math;
+
+struct LogRecord {
+  log: Json;
+  logId: str; 
+  accountId: str; 
+  timestamp: num;
+}
 
 pub class LogsApi {
   api: cloud.Api;
@@ -15,7 +23,47 @@ pub class LogsApi {
   
   new() {
     this.api = new cloud.Api();
-    this.api.post("/logs", this.intakeMessage);
+    let auth = new cognito.Cognito(this.api);
+
+    this.api.get("/", inflight (request: cloud.ApiRequest): cloud.ApiResponse => {
+      return cloud.ApiResponse{
+        status: 400, 
+        body: "Not implemented"
+      };
+    });
+
+    this.api.post("/logs", inflight (request: cloud.ApiRequest): cloud.ApiResponse => { 
+      if request.body == nil {
+        return cloud.ApiResponse{
+          status: 400, 
+          body: "Empty log message"
+        };
+      }
+      
+      let var logMessage = request.body;
+
+      let logRecord: Json = {
+        "log":logMessage, 
+        "logId":this.generateId(16),
+        "accountId":"123abcd", // @todo add account ID from auth workflow
+        "timestamp": 12314512513
+      };
+  
+      this.inboundTopic.publish(Json.stringify(logRecord));
+  
+      return cloud.ApiResponse{
+        status: 200, 
+        body: Json.stringify({})
+      };
+    });
+    auth.post("/logs");
+
+    this.api.get("/logs/:logId", inflight (request: cloud.ApiRequest): cloud.ApiResponse => {
+      return cloud.ApiResponse{
+        status: 400, 
+        body: "Not implemented"
+      };
+    });
 
     this.table = new ex.Table({
       name: "logs",
@@ -23,23 +71,33 @@ pub class LogsApi {
       columns: {
         logId: ex.ColumnType.STRING, 
         accountId: ex.ColumnType.STRING,
-        log: ex.ColumnType.JSON,
+        log: ex.ColumnType.STRING,
         timestamp: ex.ColumnType.NUMBER
       }
-    });
+    }) as "LogsTable";
 
-    this.bucket = new cloud.Bucket();
+    this.bucket = new cloud.Bucket() as "LogStorage";
 
-    this.inboundTopic = new cloud.Topic();
-    this.inboundQueue = new cloud.Queue();
+    this.inboundTopic = new cloud.Topic() as "InboundTopic";
+    this.inboundQueue = new cloud.Queue() as "InboundQueue";
+
     this.inboundTopic.subscribeQueue(this.inboundQueue);
 
-    let processFunction = new cloud.Function(this.processMessage);
+    let processFunction = new cloud.Function(inflight (event: str?) => {
+      this.processMessage(event);
+    }) as "ProcessMessageFunction";
 
-    this.outboundTopic = new cloud.Topic();
-    this.outboundQueue = new cloud.Queue();
-    this.outboundTopic.subscribeQueue(this.outboundQueue);
+    this.inboundQueue.setConsumer(inflight (message: str?) => {
+      this.processMessage(message);
+    });
     
+    this.outboundTopic = new cloud.Topic() as "OutboundTopic";
+    this.outboundQueue = new cloud.Queue() as "OutboundQueue";
+    this.outboundTopic.subscribeQueue(this.outboundQueue); 
+    this.outboundQueue.setConsumer(inflight (message: str?) => {
+      let var logRecord = LogRecord.fromJson(message);
+      this.bucket.put(logRecord.logId, Json.stringify(logRecord));
+    });
   }
 
   pub inflight generateId(length: num): str {
@@ -47,54 +105,39 @@ pub class LogsApi {
     let characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let charactersLength = characters.length;
     let var counter = 0;
+
     while (counter < length) {
-      result += characters.at(math.floor(math.random() * charactersLength));
+      let randomIndex = math.floor(math.random() * charactersLength);
+      result += characters.at(randomIndex);
       counter += 1;
     }
+
     return result;
   }
 
-  pub inflight intakeMessage(request: cloud.ApiRequest): cloud.ApiResponse { 
-    if request.body == nil {
-      return cloud.ApiResponse{
-        status: 400, 
-        body: "Empty log message"
-      };
-    }
-
-    let var logMessage: str = request.body!;
-
-    let logRecord: Json = {
-      "message":logMessage, 
-      "logId":this.generateId(16)
-      // @todo add account ID from auth workflow
-    };
-
-    this.inboundTopic.publish(Json.stringify(logRecord));
-
-    return cloud.ApiResponse{
-      status: 200, 
-      body: Json.stringify({})
-    };
-  }
-
-  pub inflight processMessage(message:str?): str? {
-    if message == nil {
+  pub inflight processMessage(body:str?): str? {
+    if body == nil {
       throw "Event received was empty";
     }
 
     log("Message received:");
-    log(message!);
+    log(body!);
     
-    let logObject = Json.parse(message!);
+    let var logRecord: LogRecord = LogRecord.fromJson(Json.parse(body!));
 
     // Process logic goes here
 
 
     // Log is finished processing
 
-    this.outboundTopic.publish(message!);
+    this.table.insert(logRecord.logId, logRecord);
 
-    return "return value";
+    this.outboundTopic.publish(Json.stringify(logRecord));
+
+    return Json.stringify(this.table.get(logRecord.logId));
+  }
+  
+  pub inflight getLogRecord(logId: str): LogRecord {
+    return LogRecord.fromJson(this.table.get(logId));
   }
 }
